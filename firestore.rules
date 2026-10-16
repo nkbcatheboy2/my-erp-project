@@ -1,0 +1,250 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function rolePath(uid) {
+      return /databases/$(database)/documents/staffRoles/$(uid);
+    }
+
+    function isStaff() {
+      return signedIn()
+        && exists(rolePath(request.auth.uid))
+        && get(rolePath(request.auth.uid)).data.active == true
+        && get(rolePath(request.auth.uid)).data.role in ['admin', 'employee'];
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(rolePath(request.auth.uid))
+        && get(rolePath(request.auth.uid)).data.active == true
+        && get(rolePath(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isSuperAdmin() {
+      let staff = get(rolePath(request.auth.uid)).data;
+      return isAdmin()
+        && (!staff.keys().hasAny(['accessProfile']) || staff.accessProfile == 'super_admin');
+    }
+
+    function canManage(permission) {
+      let staff = get(rolePath(request.auth.uid)).data;
+      let permissions = staff.get(
+        'permissions', ['properties', 'applications', 'propertyApplicants', 'payroll', 'lottery', 'auction', 'fcfs']
+      );
+      return isAdmin()
+        || (isStaff() && (permissions.hasAny([permission])
+          || (permission == 'lottery' && permissions.hasAny(['auction']))));
+    }
+
+      function hasExactPermission(permission) {
+        let staff = get(rolePath(request.auth.uid)).data;
+        let permissions = staff.get(
+          'permissions', ['properties', 'applications', 'propertyApplicants', 'payroll', 'lottery', 'auction', 'fcfs']
+        );
+        return isAdmin() || (isStaff() && permissions.hasAny([permission]));
+      }
+
+    function isOpenPublishedPlan(planId, planType) {
+      let planPath = /databases/$(database)/documents/plans/$(planId);
+      return exists(planPath)
+        && get(planPath).data.isPublished == true
+        && get(planPath).data.status in ['open', 'upcoming']
+        && get(planPath).data.applicationStartAt <= request.time
+        && get(planPath).data.applicationEndAt >= request.time
+        && get(planPath).data.planType == planType;
+    }
+
+    match /staffRoles/{uid} {
+      allow get: if isSuperAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isSuperAdmin();
+      allow create, update, delete: if isSuperAdmin();
+    }
+
+    match /plans/{planId} {
+      allow get, list: if canManage('lottery')
+        || (resource.data.isPublished == true && resource.data.status in ['open', 'upcoming']);
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /applications/{applicationId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll([
+          'applicationId', 'reference', 'planId', 'planType', 'planTitle', 'scheme',
+          'applicantUid', 'fullName', 'guardianName', 'dateOfBirth', 'gender',
+          'mobile', 'identityNumber', 'annualIncome', 'category', 'address',
+          'city', 'state', 'pinCode', 'declaration', 'status', 'submittedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'applicationId', 'reference', 'planId', 'planType', 'planTitle', 'scheme',
+          'applicantUid', 'fullName', 'guardianName', 'dateOfBirth', 'gender',
+          'mobile', 'email', 'identityNumber', 'annualIncome', 'category',
+          'occupation', 'address', 'city', 'state', 'pinCode', 'unitPreference',
+          'bidAmount', 'declaration', 'status', 'submittedAt'
+        ])
+        && request.resource.data.applicationId == applicationId
+        && request.resource.data.applicantUid == request.auth.uid
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.submittedAt == request.time
+        && request.resource.data.planType in ['lottery', 'auction']
+        && request.resource.data.declaration == true
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.mobile is string
+        && request.resource.data.mobile.matches('^[0-9]{10}$')
+        && request.resource.data.identityNumber is string
+        && request.resource.data.identityNumber.size() >= 4
+        && request.resource.data.identityNumber.size() <= 32
+        && (request.resource.data.annualIncome is int || request.resource.data.annualIncome is float)
+        && request.resource.data.annualIncome >= 0
+        && request.resource.data.pinCode is string
+        && request.resource.data.pinCode.matches('^[0-9]{6}$')
+        && (
+          (request.resource.data.planType == 'lottery'
+            && !request.resource.data.keys().hasAny(['bidAmount']))
+          || (request.resource.data.planType == 'auction'
+            && request.resource.data.keys().hasAny(['bidAmount'])
+            && (request.resource.data.bidAmount is int || request.resource.data.bidAmount is float)
+            && request.resource.data.bidAmount >= get(
+              /databases/$(database)/documents/plans/$(request.resource.data.planId)
+            ).data.reservePrice)
+        )
+        && isOpenPublishedPlan(request.resource.data.planId, request.resource.data.planType);
+
+      allow get, list: if canManage('applications')
+        || (signedIn() && resource.data.applicantUid == request.auth.uid);
+      allow update: if canManage('applications')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'updatedAt'])
+        && request.resource.data.status in ['submitted', 'under_review', 'approved', 'rejected']
+        && request.resource.data.reviewedBy == request.auth.uid;
+      allow delete: if isAdmin();
+    }
+
+    match /results/{resultId} {
+      allow get, list: if canManage('lottery') || resource.data.isPublished == true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /properties/{propertyId} {
+      allow get, list: if canManage('properties') || canManage('propertyApplicants');
+      allow create: if canManage('properties')
+        && propertyId.matches('^[0-9]{6}$')
+        && request.resource.data.propertyId == propertyId
+        && request.resource.data.allocationMode in ['lottery', 'auction', 'fcfs', 'direct']
+        && (request.resource.data.cost is int || request.resource.data.cost is float)
+        && request.resource.data.cost >= 0
+        && (request.resource.data.allocationMode != 'auction'
+          || (request.resource.data.auctionStartAt is timestamp
+            && request.resource.data.auctionEndAt is timestamp
+            && request.resource.data.auctionEndAt > request.resource.data.auctionStartAt))
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if canManage('properties')
+        && propertyId.matches('^[0-9]{6}$')
+        && request.resource.data.propertyId == propertyId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'ownerName', 'allotmentMethod', 'allotteeApplicationId', 'updatedBy', 'updatedAt'
+        ])
+        && resource.data.get('allocationMode', 'direct') == request.resource.data.allotmentMethod
+        && (
+          (request.resource.data.allotmentMethod == 'fcfs'
+            && request.resource.data.status == 'reserved'
+            && resource.data.status == 'available'
+            && canManage('fcfs'))
+          || (request.resource.data.allotmentMethod == 'lottery'
+            && request.resource.data.status == 'allotted'
+            && hasExactPermission('lottery'))
+          || (request.resource.data.allotmentMethod == 'auction'
+            && request.resource.data.status == 'allotted'
+            && request.time >= resource.data.auctionEndAt
+            && canManage('auction'))
+          || (request.resource.data.allotmentMethod == 'direct'
+            && request.resource.data.status == 'allotted'
+            && canManage('propertyApplicants'))
+        );
+      allow delete: if canManage('properties');
+    }
+
+    match /propertyApplications/{applicationId} {
+      allow get, list: if canManage('propertyApplicants');
+      allow create: if canManage('propertyApplicants')
+        && request.resource.data.propertyId is string
+        && request.resource.data.propertyId.matches('^[0-9]{6}$')
+        && exists(/databases/$(database)/documents/properties/$(request.resource.data.propertyId))
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.status == 'available'
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.get(
+          'allocationMode', 'direct'
+        ) == request.resource.data.allotmentMethod
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.mobile is string
+        && request.resource.data.mobile.matches('^[0-9]{10}$')
+        && request.resource.data.allotmentMethod in ['lottery', 'auction', 'fcfs', 'direct']
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.get(
+          'allocationMode', 'direct'
+        ) == request.resource.data.allotmentMethod
+        && (
+          (request.resource.data.allotmentMethod == 'auction'
+            && canManage('auction')
+            && request.resource.data.status == 'bid_submitted'
+            && request.time >= get(
+              /databases/$(database)/documents/properties/$(request.resource.data.propertyId)
+            ).data.auctionStartAt
+            && request.time <= get(
+              /databases/$(database)/documents/properties/$(request.resource.data.propertyId)
+            ).data.auctionEndAt
+            && (request.resource.data.bidAmount is int || request.resource.data.bidAmount is float)
+            && request.resource.data.bidAmount >= get(
+              /databases/$(database)/documents/properties/$(request.resource.data.propertyId)
+            ).data.cost)
+          || (request.resource.data.allotmentMethod == 'fcfs'
+            && canManage('fcfs')
+            && request.resource.data.status == 'booked')
+          || (request.resource.data.allotmentMethod == 'lottery'
+            && hasExactPermission('lottery')
+            && request.resource.data.status == 'submitted')
+          || (request.resource.data.allotmentMethod == 'direct'
+            && canManage('propertyApplicants')
+            && request.resource.data.status == 'submitted')
+        );
+      allow update: if canManage('propertyApplicants')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'allottedBy', 'allottedAt', 'updatedAt'
+        ])
+        && request.resource.data.status in ['allotted', 'waitlisted', 'unsuccessful']
+        && (
+          (resource.data.allotmentMethod == 'lottery' && hasExactPermission('lottery'))
+          || (resource.data.allotmentMethod == 'auction' && canManage('auction'))
+          || (resource.data.allotmentMethod in ['direct', 'fcfs'] && canManage('propertyApplicants'))
+        );
+      allow delete: if isAdmin();
+    }
+
+    match /auditLogs/{eventId} {
+      allow get, list: if isAdmin();
+      allow create: if isStaff()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && (
+          (request.resource.data.action == 'property.application_submitted'
+            && ((request.resource.data.details.mode == 'lottery' && hasExactPermission('lottery'))
+              || (request.resource.data.details.mode == 'direct' && canManage('propertyApplicants'))))
+          || (request.resource.data.action in ['property.auction_bid', 'property.auction_closed']
+            && canManage('auction'))
+          || (request.resource.data.action == 'property.fcfs_booked' && canManage('fcfs'))
+          || (request.resource.data.action == 'property.direct_allotment'
+            && canManage('propertyApplicants'))
+          || (request.resource.data.action == 'property.lottery_draw'
+            && hasExactPermission('lottery'))
+        );
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
